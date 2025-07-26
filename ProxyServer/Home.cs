@@ -13,167 +13,133 @@ namespace ProxyServerApp
 {
 	public partial class Home : Form
 	{
-		ProxyServer proxyServer = new ProxyServer();
-		string[] BlockedWebs { get; set; }
-		public static string HomeDirectory { get; set; } = Environment.CurrentDirectory;
+		private ProxyServer proxyServer;
+		private string[] blockedWebs = [];
+		public static string HomeDirectory { get; private set; } = Environment.CurrentDirectory;
 
 		public Home()
 		{
 			InitializeComponent();
 
-			//ByPass Certificate Check
+			// Bypass certificate check for all requests
 			ServicePointManager.ServerCertificateValidationCallback +=
-			 (s, certificate, chain, sslPolicyErrors) => true;
+				(s, certificate, chain, sslPolicyErrors) => true;
 
 			HomeDirectory = Environment.CurrentDirectory;
 			decryptSSLCheck.Checked = Properties.Settings.Default.isDecryptSSL;
 			portNum.Value = Properties.Settings.Default.Port;
+
+			// Load blocked websites from file at startup
+			LoadBlockedWebs();
 
 			if (Properties.Settings.Default.isStartOnLoad)
 			{
 				StartProxy();
 			}
 
-			this.FormClosed += (x, y) =>
+			FormClosed += (x, y) =>
 			{
 				Application.Exit();
 				Environment.Exit(0);
 			};
 		}
 
-
 		private void StartBtn_Click(object sender, EventArgs e)
 		{
 			StartProxy();
 		}
 
+		/// <summary>
+		/// Starts the proxy server with configured endpoints.
+		/// </summary>
 		private void StartProxy()
 		{
 			if (portNum.Value == 0)
 			{
-				MessageBox.Show("Please Enter available Port Number"); return;
+				MessageBox.Show("Please Enter available Port Number");
+				return;
 			}
+
 			try
 			{
 				proxyServer = new ProxyServer();
 
-				// locally trust root certificate used by this proxy 
-				// proxyServer.CertificateManager.TrustRootCertificate(true);
-
-				// optionally set the Certificate Engine
-				// Under Mono only BouncyCastle will be supported
-				// proxyServer.CertificateManager.CertificateEngine = Network.CertificateEngine.BouncyCastle;
-				//////////////////////////////////////////////////////////////////////
-
+				// Event handlers for proxy server
 				proxyServer.BeforeRequest += OnRequest;
 				proxyServer.BeforeResponse += OnResponse;
 				proxyServer.ServerCertificateValidationCallback += OnCertificateValidation;
 				proxyServer.ClientCertificateSelectionCallback += OnCertificateSelection;
 
-
-				//proxyServer.ClientCertificateSelectionCallback += OnCertificateSelection;
-
-				var explicitEndPoint = new ExplicitProxyEndPoint(IPAddress.Any, (int)portNum.Value, decryptSSLCheck.Checked)
-				{
-					// Use self-issued generic certificate on all https requests
-					// Optimizes performance by not creating a certificate for each https-enabled domain
-					// Useful when certificate trust is not required by proxy clients
-					// GenericCertificate = new X509Certificate2(Path.Combine(System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "genericcert.pfx"), "password")
-				};
-
-				// Fired when a CONNECT request is received
+				// Explicit endpoint (client knows about proxy)
+				var explicitEndPoint = new ExplicitProxyEndPoint(IPAddress.Any, (int)portNum.Value, decryptSSLCheck.Checked);
 				explicitEndPoint.BeforeTunnelConnectRequest += OnBeforeTunnelConnectRequest;
-
-				// An explicit endpoint is where the client knows about the existence of a proxy
-				// So client sends request in a proxy friendly manner
 				proxyServer.AddEndPoint(explicitEndPoint);
-				proxyServer.Start();
 
-				// Transparent endpoint is useful for reverse proxy (client is not aware of the existence of proxy)
-				// A transparent endpoint usually requires a network router port forwarding HTTP(S) packets or DNS
-				// to send data to this endPoint
-				var transparentEndPoint = new TransparentProxyEndPoint(IPAddress.Any, ((int)portNum.Value + 1), true)
-				{
-					// Generic Certificate hostname to use
-					// when SNI is disabled by client
-					// GenericCertificateName = "google.com"
-				};
-
+				// Transparent endpoint (client does not know about proxy)
+				var transparentEndPoint = new TransparentProxyEndPoint(IPAddress.Any, ((int)portNum.Value + 1), true);
 				proxyServer.AddEndPoint(transparentEndPoint);
 
-				//
+				proxyServer.Start();
+
 				portNum.Enabled = false;
 				startBtn.Enabled = false;
 
 				foreach (var endPoint in proxyServer.ProxyEndPoints)
 				{
-					majorLogsTxt.AppendText(string.Format("Listening on '{0}' endpoint at Ip {1} and port: {2} \n",
-						  endPoint.GetType().Name, endPoint.IpAddress, endPoint.Port));
-
-					Logger.Instance.Log(string.Format("Listening on '{0}' endpoint at Ip {1} and port: {2} \n",
-						endPoint.GetType().Name, endPoint.IpAddress, endPoint.Port));
+					var logMsg = $"Listening on '{endPoint.GetType().Name}' endpoint at Ip {endPoint.IpAddress} and port: {endPoint.Port}\n";
+					majorLogsTxt.AppendText(logMsg);
+					Logger.Instance.Log(logMsg);
 				}
-
 			}
-			catch (Exception t)
+			catch (Exception ex)
 			{
-				Logger.Instance.LogError(t.Message, t);
-				majorLogsTxt.AppendText(t.Message);
+				Logger.Instance.LogError(ex.Message, ex);
+				majorLogsTxt.AppendText(ex.Message);
 			}
-
 		}
 
+		/// <summary>
+		/// Handles incoming requests, blocks if URL matches blocked list, and logs request.
+		/// </summary>
 		public async Task OnRequest(object sender, SessionEventArgs e)
 		{
-			await Task.CompletedTask;
-
-			//Blocker
 			var url = e.HttpClient.Request.Url;
-			var isUrlBlocked = BlockedWebs.Any(url.StartsWith);
-
-			if (isUrlBlocked)
+			if (IsUrlBlocked(url))
 			{
-				e.Ok("<!DOCTYPE html>" +
-					"<html><body><h1>" +
-					"Website Blocked" +
-					"</h1>" +
-					"<p>Blocked by XC.</p>" +
-					"</body>" +
-					"</html>");
+				e.Ok("<!DOCTYPE html><html><body><h1>Website Blocked</h1><p>Blocked by XC.</p></body></html>");
+				return;
 			}
 
-			// Logger
+			// Log request asynchronously
 			await Task.Run(() =>
 			{
 				var datetime = DateTime.Now;
-
 				Logger.Instance.Log($"""
-				-----------
-				{datetime:yyyyMMdd_HHmmss.fff}
-				{e.HttpClient.Request.Url}
-				""");
+                    -----------
+                    {datetime:yyyyMMdd_HHmmss.fff}
+                    {url}
+                    """);
 
-				//Detailed Logs
-				Logger.Instance.LogVerboseIf(() => detailedLogsCheck.Checked,
-					$"""
-					-----------
-					{datetime:yyyyMMdd_HHmmss.fff}
-					
-					Request Header
-					{string.Join("\r\n", e.HttpClient.Request.Headers.GetAllHeaders().Select(x => $"{x.Name}:{x.Value}"))}
-					
-					UserData
-					{e.HttpClient.UserData}
-					
-					TimeLine
-					{string.Join("\r\n", e.TimeLine.Select(x => $"{x.Key}:{x.Value}"))}
-					[][][][]
-					""");
-
-				Invoke(() =>
+				if (detailedLogsCheck.Checked)
 				{
-					Text = "[Connects]" + proxyServer.ThreadPoolWorkerThread.ToString();
-				});
+					Logger.Instance.LogVerbose($"""
+                        -----------
+                        {datetime:yyyyMMdd_HHmmss.fff}
+
+                        Request Header
+                        {string.Join("\r\n", e.HttpClient.Request.Headers.GetAllHeaders().Select(x => $"{x.Name}:{x.Value}"))}
+
+                        UserData
+                        {e.HttpClient.UserData}
+
+                        TimeLine
+                        {string.Join("\r\n", e.TimeLine.Select(x => $"{x.Key}:{x.Value}"))}
+                        [][][]
+                        """);
+				}
+
+				// Update UI thread safely
+				Invoke(() => Text = "[Connects]" + proxyServer.ThreadPoolWorkerThread);
 			}).ConfigureAwait(false);
 		}
 
@@ -182,12 +148,18 @@ namespace ProxyServerApp
 			Application.Exit();
 		}
 
-
+		/// <summary>
+		/// Opens the blocked websites file for editing and reloads the list.
+		/// </summary>
 		private void BlockFileBtn_Click(object sender, EventArgs e)
 		{
-			Process.Start(HomeDirectory + @"\BlockedWebs.txt", "notepad.exe").WaitForExit();
+			var blockFilePath = Path.Combine(HomeDirectory, "BlockedWebs.txt");
+			using (var process = Process.Start("notepad.exe", blockFilePath))
+			{
+				process?.WaitForExit();
+			}
 			MessageBox.Show("Blocks Updated");
-			BlockedWebs = File.ReadAllLines(HomeDirectory + @"\BlockedWebs.txt");
+			LoadBlockedWebs();
 		}
 
 		private void ClearMajorLogsaBtn_Click(object sender, EventArgs e)
@@ -210,17 +182,46 @@ namespace ProxyServerApp
 			await Task.CompletedTask;
 		}
 
+		/// <summary>
+		/// Handles HTTPS tunnel connect requests, blocks if URL matches blocked list.
+		/// </summary>
 		private async Task OnBeforeTunnelConnectRequest(object sender, TunnelConnectSessionEventArgs e)
 		{
-			//Blocker
 			var url = e.HttpClient.Request.Url;
-			var isUrlBlocked = BlockedWebs.Any(url.StartsWith);
-
-			if (isUrlBlocked)
+			if (IsUrlBlocked(url))
 			{
 				e.DecryptSsl = true;
 			}
 			await Task.CompletedTask;
+		}
+
+		/// <summary>
+		/// Loads blocked websites from file into memory.
+		/// </summary>
+		private void LoadBlockedWebs()
+		{
+			var blockFilePath = Path.Combine(HomeDirectory, "BlockedWebs.txt");
+			if (File.Exists(blockFilePath))
+			{
+				blockedWebs = [.. File.ReadAllLines(blockFilePath)
+					.Where(line => !string.IsNullOrWhiteSpace(line))
+					.Select(line => line.Trim())];
+			}
+			else
+			{
+				blockedWebs = Array.Empty<string>();
+			}
+		}
+
+		/// <summary>
+		/// Checks if the given URL matches any blocked website prefix.
+		/// </summary>
+		private bool IsUrlBlocked(string url)
+		{
+			// Use StringComparison.OrdinalIgnoreCase for case-insensitive matching
+			return blockedWebs.Any(blocked =>
+				!string.IsNullOrEmpty(blocked) &&
+				url.StartsWith(blocked, StringComparison.OrdinalIgnoreCase));
 		}
 	}
 }
