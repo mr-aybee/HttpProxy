@@ -1,6 +1,6 @@
 # Orbyn Proxy Core
 
-`Proxy.Core` is a .NET 10 Worker Service from Orbyn Technologies using Titanium.Web.Proxy 5.2.0. It has two execution experiences: a full-screen terminal application for interactive use and a headless service host for Windows Service, systemd, containers, and process supervisors.
+`Proxy.Core` is a .NET 10 Worker Service from Orbyn Technologies using Titanium.Web.Proxy 5.2.0. It provides a full-screen terminal control surface, a detachable background mode, and a headless host for Windows Service, systemd, containers, and process supervisors.
 
 The original .NET Framework WinForms application remains in `ProxyServer`; new development should target `Proxy.Core`.
 
@@ -10,7 +10,13 @@ The original .NET Framework WinForms application remains in `ProxyServer`; new d
 dotnet run --project Proxy.Core/Proxy.Core.csproj
 ```
 
-An interactive launch takes ownership of the terminal and displays live status, listeners, connections, request counters, and recent activity without scrolling the console. Press `Q`, `Escape`, or `Ctrl+C` for a graceful shutdown; press `C` to clear recent activity.
+An interactive launch takes ownership of the terminal and displays live status, listeners, connections, traffic counters, and recent activity without scrolling the console. Available controls:
+
+- `R` safely restarts the proxy and reloads the current configuration.
+- `B` opens confirmation to move the proxy into a detached background process.
+- `S` displays service and headless-hosting guidance.
+- `C` clears recent activity.
+- `Q`, `Escape`, or `Ctrl+C` performs a graceful shutdown.
 
 The safe default listens on `127.0.0.1:12000`, tunnels HTTPS without decrypting it, does not alter the system proxy, and does not trust or generate a certificate until TLS inspection is enabled.
 
@@ -53,6 +59,18 @@ export HTTPPROXY_AUTH_PASSWORD='use-a-strong-password'
 ```
 
 Replace the example password and restrict inbound TCP port `12000` in both the Linux firewall and hosting-provider firewall to trusted client IP addresses. Never expose an unauthenticated proxy publicly.
+
+## Background mode
+
+Press `B` in the terminal dashboard or launch directly with `--background`:
+
+```bash
+./Proxy.Core --background
+```
+
+Proxy.Core starts a detached headless child, reports its process ID, and writes rolling logs to `logs/proxy-core.log`. Configure the path and retention through `Proxy:Background` in `appsettings.json`.
+
+Background mode is intended for temporary detached execution. Use systemd or Windows Service for boot startup, health supervision, automatic recovery, and OS-native service logs.
 
 ## Service mode
 

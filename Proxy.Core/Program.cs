@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Options;
 using Orbyn.Proxy.Core.Configuration;
 using Orbyn.Proxy.Core.ConsoleUi;
+using Orbyn.Proxy.Core.Hosting;
 using Orbyn.Proxy.Core.Logging;
 using Orbyn.Proxy.Core.Policies;
 using Orbyn.Proxy.Core.Runtime;
@@ -35,17 +36,32 @@ internal static class Program
             });
             builder.Configuration.AddProxyCommandLine(normalizedArgs);
 
-            var serviceMode = builder.Configuration.GetValue<bool>("Commands:Service");
+            var backgroundRequested = builder.Configuration.GetValue<bool>("Commands:Background");
+            var backgroundChild = builder.Configuration.GetValue<bool>("Commands:BackgroundChild");
+            var serviceMode = builder.Configuration.GetValue<bool>("Commands:Service") || backgroundChild;
             var controlCommand = builder.Configuration.GetValue<bool>("Commands:PrintConfig") ||
                                  builder.Configuration.GetValue<bool>("Commands:ValidateConfig");
-            var terminalMode = !serviceMode && !controlCommand && CanOwnTerminal();
+            var terminalMode = !serviceMode && !backgroundRequested && !controlCommand && CanOwnTerminal();
             var runtimeState = new ProxyRuntimeState();
+            var transitionState = new ExecutionTransitionState();
 
             builder.Services.AddWindowsService(serviceOptions =>
                 serviceOptions.ServiceName = "Orbyn Proxy Core");
             builder.Services.AddSystemd();
 
-            if (terminalMode)
+            if (backgroundChild)
+            {
+                var background = builder.Configuration
+                    .GetSection("Proxy:Background")
+                    .Get<BackgroundOptions>() ?? new BackgroundOptions();
+                var logPath = ResolveContentPath(background.LogFilePath);
+                builder.Logging.ClearProviders();
+                builder.Logging.AddProvider(new RollingFileLoggerProvider(
+                    logPath,
+                    background.MaxFileSizeBytes,
+                    background.MaxRolledFiles));
+            }
+            else if (terminalMode)
             {
                 builder.Logging.ClearProviders();
                 builder.Logging.AddProvider(new DashboardLoggerProvider(runtimeState));
@@ -60,13 +76,17 @@ internal static class Program
                 .ValidateOnStart();
             builder.Services.AddSingleton<IValidateOptions<ProxyOptions>, ProxyOptionsValidator>();
             builder.Services.AddSingleton(runtimeState);
+            builder.Services.AddSingleton(transitionState);
+            builder.Services.AddSingleton(new ApplicationArguments(args));
             builder.Services.AddSingleton<ProxyPolicyProvider>();
+            builder.Services.AddSingleton<TitaniumProxyHostedService>();
             if (terminalMode)
             {
                 builder.Services.AddHostedService<TerminalDashboardService>();
             }
 
-            builder.Services.AddHostedService<TitaniumProxyHostedService>();
+            builder.Services.AddHostedService(provider =>
+                provider.GetRequiredService<TitaniumProxyHostedService>());
 
             var drainSeconds = builder.Configuration.GetValue<int>(
                 "Proxy:Limits:ShutdownDrainSeconds",
@@ -89,7 +109,26 @@ internal static class Program
                 return 0;
             }
 
+            if (backgroundRequested && !backgroundChild)
+            {
+                var result = BackgroundProcessLauncher.Start(args);
+                if (!result.Started)
+                {
+                    Console.Error.WriteLine($"Could not start Proxy.Core in background: {result.Error}");
+                    return 1;
+                }
+
+                Console.WriteLine($"Proxy.Core started in background (PID {result.ProcessId}).");
+                Console.WriteLine($"Log: {ResolveContentPath(options.Background.LogFilePath)}");
+                return 0;
+            }
+
             await host.RunAsync();
+            if (!string.IsNullOrWhiteSpace(transitionState.ExitMessage))
+            {
+                Console.WriteLine(transitionState.ExitMessage);
+            }
+
             return 0;
         }
         catch (OptionsValidationException exception)
@@ -112,7 +151,9 @@ internal static class Program
     private static string[] NormalizeBooleanSwitches(string[] args) => args
         .Select(argument => argument.Equals("--validate-config", StringComparison.OrdinalIgnoreCase) ||
                             argument.Equals("--print-config", StringComparison.OrdinalIgnoreCase) ||
-                            argument.Equals("--service", StringComparison.OrdinalIgnoreCase)
+                            argument.Equals("--service", StringComparison.OrdinalIgnoreCase) ||
+                            argument.Equals("--background", StringComparison.OrdinalIgnoreCase) ||
+                            argument.Equals("--background-child", StringComparison.OrdinalIgnoreCase)
             ? argument + "=true"
             : argument)
         .ToArray();
@@ -126,4 +167,8 @@ internal static class Program
         Environment.UserInteractive &&
         !Console.IsInputRedirected &&
         !Console.IsOutputRedirected;
+
+    private static string ResolveContentPath(string path) => Path.IsPathRooted(path)
+        ? Path.GetFullPath(path)
+        : Path.GetFullPath(path, AppContext.BaseDirectory);
 }

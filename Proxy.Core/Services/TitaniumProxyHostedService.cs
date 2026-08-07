@@ -15,7 +15,7 @@ using Titanium.Web.Proxy.Network;
 namespace Orbyn.Proxy.Core.Services;
 
 internal sealed class TitaniumProxyHostedService(
-    IOptions<ProxyOptions> options,
+    IOptionsMonitor<ProxyOptions> options,
     ProxyPolicyProvider policies,
     ProxyRuntimeState runtimeState,
     IHostEnvironment environment,
@@ -30,8 +30,10 @@ internal sealed class TitaniumProxyHostedService(
         </html>
         """;
 
+    private readonly SemaphoreSlim lifecycleGate = new(1, 1);
     private ProxyServer? proxyServer;
     private ExplicitProxyEndPoint? explicitEndPoint;
+    private ProxyOptions? activeSettings;
     private bool changedSystemProxy;
     private bool disposed;
 
@@ -44,15 +46,64 @@ internal sealed class TitaniumProxyHostedService(
 
         proxyServer?.Dispose();
         proxyServer = null;
+        lifecycleGate.Dispose();
         disposed = true;
     }
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        await lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            StartCore(cancellationToken);
+        }
+        finally
+        {
+            lifecycleGate.Release();
+        }
+    }
+
+    public async Task RestartAsync(CancellationToken cancellationToken)
+    {
+        await lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            runtimeState.MarkRestarting();
+            logger.LogInformation("Restarting proxy and reloading configuration");
+            await StopCoreAsync(cancellationToken, finalStop: false);
+            StartCore(cancellationToken);
+        }
+        catch (Exception exception)
+        {
+            runtimeState.MarkFaulted(exception);
+            throw;
+        }
+        finally
+        {
+            lifecycleGate.Release();
+        }
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            await StopCoreAsync(cancellationToken, finalStop: true);
+        }
+        finally
+        {
+            lifecycleGate.Release();
+        }
+    }
+
+    private void StartCore(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         runtimeState.MarkStarting();
 
-        var settings = options.Value;
+        var settings = options.CurrentValue;
+        activeSettings = settings;
         policies.Load(settings);
 
         var server = CreateServer(settings);
@@ -79,7 +130,6 @@ internal sealed class TitaniumProxyHostedService(
                 server.ProxyEndPoints.Select(endpoint =>
                     $"{GetEndPointName(endpoint)}  {endpoint.IpAddress}:{endpoint.Port}"));
             LogStartup(settings, server);
-            return Task.CompletedTask;
         }
         catch (Exception exception)
         {
@@ -91,20 +141,30 @@ internal sealed class TitaniumProxyHostedService(
             }
 
             server.Dispose();
+            explicitEndPoint = null;
+            activeSettings = null;
             throw;
         }
     }
 
-    public async Task StopAsync(CancellationToken cancellationToken)
+    private async Task StopCoreAsync(CancellationToken cancellationToken, bool finalStop)
     {
         var server = proxyServer;
         if (server is null)
         {
+            if (finalStop)
+            {
+                runtimeState.MarkStopped();
+            }
+
             return;
         }
 
-        logger.LogInformation("Stopping Orbyn Proxy Core; draining active connections");
-        runtimeState.MarkStopping();
+        if (finalStop)
+        {
+            logger.LogInformation("Stopping Orbyn Proxy Core; draining active connections");
+            runtimeState.MarkStopping();
+        }
 
         if (changedSystemProxy)
         {
@@ -121,7 +181,8 @@ internal sealed class TitaniumProxyHostedService(
 
         try
         {
-            var drainTimeout = TimeSpan.FromSeconds(options.Value.Limits.ShutdownDrainSeconds);
+            var drainTimeout = TimeSpan.FromSeconds(
+                (activeSettings ?? options.CurrentValue).Limits.ShutdownDrainSeconds);
             await server.StopAsync(drainTimeout).WaitAsync(cancellationToken);
         }
         catch (OperationCanceledException)
@@ -134,10 +195,17 @@ internal sealed class TitaniumProxyHostedService(
             server.Dispose();
             proxyServer = null;
             explicitEndPoint = null;
-            runtimeState.MarkStopped();
+            activeSettings = null;
+            if (finalStop)
+            {
+                runtimeState.MarkStopped();
+            }
         }
 
-        logger.LogInformation("Orbyn Proxy Core stopped");
+        if (finalStop)
+        {
+            logger.LogInformation("Orbyn Proxy Core stopped");
+        }
     }
 
     private ProxyServer CreateServer(ProxyOptions settings)
@@ -339,7 +407,7 @@ internal sealed class TitaniumProxyHostedService(
             return Task.CompletedTask;
         }
 
-        args.DecryptSsl = policies.ShouldInspect(host, options.Value.Tls.Mode);
+        args.DecryptSsl = policies.ShouldInspect(host, GetActiveSettings().Tls.Mode);
         LogRequest("CONNECT", host);
         return Task.CompletedTask;
     }
@@ -354,7 +422,7 @@ internal sealed class TitaniumProxyHostedService(
             return Task.CompletedTask;
         }
 
-        args.DecryptSsl = policies.ShouldInspect(args.SniHostName, options.Value.Tls.Mode);
+        args.DecryptSsl = policies.ShouldInspect(args.SniHostName, GetActiveSettings().Tls.Mode);
         LogRequest("TLS", args.SniHostName);
         return Task.CompletedTask;
     }
@@ -380,7 +448,7 @@ internal sealed class TitaniumProxyHostedService(
 
     private void LogRequest(string method, string? target)
     {
-        var diagnostics = options.Value.Diagnostics;
+        var diagnostics = GetActiveSettings().Diagnostics;
         if (!diagnostics.LogRequests || Random.Shared.NextDouble() > diagnostics.RequestSampleRate)
         {
             return;
@@ -425,6 +493,8 @@ internal sealed class TitaniumProxyHostedService(
     private string ResolvePath(string path) => Path.IsPathRooted(path)
         ? Path.GetFullPath(path)
         : Path.GetFullPath(path, environment.ContentRootPath);
+
+    private ProxyOptions GetActiveSettings() => activeSettings ?? options.CurrentValue;
 
     private static Uri? ParseOptionalUri(string? value) => string.IsNullOrWhiteSpace(value)
         ? null

@@ -26,6 +26,8 @@ public sealed class ProxyOptions
     public DiagnosticsOptions Diagnostics { get; set; } = new();
 
     public TerminalOptions Terminal { get; set; } = new();
+
+    public BackgroundOptions Background { get; set; } = new();
 }
 
 public sealed class ListenerOptions
@@ -266,4 +268,13 @@ public sealed class TerminalOptions
     public int RefreshMilliseconds { get; set; } = 250;
 
     public int MaxActivityEntries { get; set; } = 200;
+}
+
+public sealed class BackgroundOptions
+{
+    public string LogFilePath { get; set; } = "logs/proxy-core.log";
+
+    public long MaxFileSizeBytes { get; set; } = 10 * 1024 * 1024;
+
+    public int MaxRolledFiles { get; set; } = 5;
 }

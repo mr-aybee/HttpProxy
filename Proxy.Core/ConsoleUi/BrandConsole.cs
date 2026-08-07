@@ -29,6 +29,7 @@ internal static class BrandConsole
         Console.WriteLine("  --http2 <bool>                 Enable HTTP/2");
         Console.WriteLine("  --http3 <bool>                 Enable experimental HTTP/3");
         Console.WriteLine("  --service                      Run headless with OS-service logging");
+        Console.WriteLine("  --background                   Detach and write logs to the background log file");
         Console.WriteLine("  --validate-config              Validate and exit");
         Console.WriteLine("  --print-config                 Print merged redacted configuration and exit");
         Console.WriteLine("  --help                         Show this help");

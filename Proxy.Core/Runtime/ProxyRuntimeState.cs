@@ -5,6 +5,7 @@ namespace Orbyn.Proxy.Core.Runtime;
 internal enum ProxyRunStatus
 {
     Starting,
+    Restarting,
     Running,
     Stopping,
     Stopped,
@@ -64,6 +65,16 @@ internal sealed class ProxyRuntimeState
             startedAt = DateTimeOffset.UtcNow;
             tlsMode = mode;
             listeners = endpointDescriptions.ToArray();
+        }
+    }
+
+    public void MarkRestarting()
+    {
+        lock (sync)
+        {
+            status = ProxyRunStatus.Restarting;
+            statusMessage = "Reloading configuration and listeners";
+            activeConnections = 0;
         }
     }
 

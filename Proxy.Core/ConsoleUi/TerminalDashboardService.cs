@@ -2,15 +2,24 @@ using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Extensions.Options;
 using Orbyn.Proxy.Core.Configuration;
+using Orbyn.Proxy.Core.Hosting;
 using Orbyn.Proxy.Core.Runtime;
+using Orbyn.Proxy.Core.Services;
 
 namespace Orbyn.Proxy.Core.ConsoleUi;
 
 internal sealed class TerminalDashboardService(
     ProxyRuntimeState state,
     IOptions<ProxyOptions> options,
-    IHostApplicationLifetime applicationLifetime) : BackgroundService
+    IHostApplicationLifetime applicationLifetime,
+    TitaniumProxyHostedService proxyService,
+    ApplicationArguments applicationArguments,
+    ExecutionTransitionState transitionState,
+    ILogger<TerminalDashboardService> logger) : BackgroundService
 {
+    private DashboardView view = DashboardView.Main;
+    private Task? activeAction;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         state.SetActivityCapacity(options.Value.Terminal.MaxActivityEntries);
@@ -21,8 +30,13 @@ internal sealed class TerminalDashboardService(
         {
             while (!stoppingToken.IsCancellationRequested)
             {
-                terminal.Render(state.GetSnapshot());
-                HandleInput();
+                terminal.Render(
+                    state.GetSnapshot(),
+                    view,
+                    activeAction is not null,
+                    options.Value.Background.LogFilePath);
+                ObserveCompletedAction();
+                HandleInput(stoppingToken);
                 await Task.Delay(refresh, stoppingToken);
             }
         }
@@ -31,17 +45,27 @@ internal sealed class TerminalDashboardService(
         }
         finally
         {
-            terminal.Render(state.GetSnapshot());
+            terminal.Render(
+                state.GetSnapshot(),
+                view,
+                activeAction is not null,
+                options.Value.Background.LogFilePath);
         }
     }
 
-    private void HandleInput()
+    private void HandleInput(CancellationToken stoppingToken)
     {
         try
         {
             while (Console.KeyAvailable)
             {
                 var key = Console.ReadKey(intercept: true).Key;
+                if (view != DashboardView.Main)
+                {
+                    HandleDialogInput(key, stoppingToken);
+                    continue;
+                }
+
                 if (key is ConsoleKey.Q or ConsoleKey.Escape)
                 {
                     state.MarkStopping();
@@ -53,12 +77,114 @@ internal sealed class TerminalDashboardService(
                 {
                     state.ClearActivity();
                 }
+
+                if (key == ConsoleKey.R && activeAction is null)
+                {
+                    activeAction = RestartProxyAsync(stoppingToken);
+                }
+
+                if (key == ConsoleKey.B)
+                {
+                    view = DashboardView.BackgroundConfirmation;
+                }
+
+                if (key == ConsoleKey.S)
+                {
+                    view = DashboardView.ServiceInfo;
+                }
             }
         }
         catch (InvalidOperationException)
         {
             // Input can disappear when a parent terminal is detached during shutdown.
         }
+    }
+
+    private void HandleDialogInput(ConsoleKey key, CancellationToken stoppingToken)
+    {
+        if (key == ConsoleKey.Escape ||
+            (view == DashboardView.BackgroundConfirmation && key == ConsoleKey.B) ||
+            (view == DashboardView.ServiceInfo && key == ConsoleKey.S))
+        {
+            view = DashboardView.Main;
+            return;
+        }
+
+        if (view == DashboardView.BackgroundConfirmation &&
+            key == ConsoleKey.Enter &&
+            activeAction is null)
+        {
+            activeAction = MoveToBackgroundAsync(stoppingToken);
+            view = DashboardView.Main;
+        }
+
+        if (view == DashboardView.ServiceInfo && key == ConsoleKey.B)
+        {
+            view = DashboardView.BackgroundConfirmation;
+        }
+    }
+
+    private async Task RestartProxyAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await proxyService.RestartAsync(cancellationToken);
+            logger.LogInformation("Proxy restart completed");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Proxy restart failed");
+        }
+    }
+
+    private async Task MoveToBackgroundAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            logger.LogInformation("Moving Proxy.Core to the background");
+            await proxyService.StopAsync(cancellationToken);
+            var result = BackgroundProcessLauncher.Start(applicationArguments.Values);
+            if (!result.Started)
+            {
+                logger.LogError("Could not start the background process: {Error}", result.Error);
+                await proxyService.StartAsync(cancellationToken);
+                return;
+            }
+
+            transitionState.ExitMessage =
+                $"Proxy.Core continues in background (PID {result.ProcessId}). " +
+                $"Log: {ResolveLogPath(options.Value.Background.LogFilePath)}";
+            applicationLifetime.StopApplication();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Could not move Proxy.Core to the background");
+        }
+    }
+
+    private void ObserveCompletedAction()
+    {
+        if (activeAction?.IsCompleted == true)
+        {
+            activeAction = null;
+        }
+    }
+
+    private static string ResolveLogPath(string path) => Path.IsPathRooted(path)
+        ? Path.GetFullPath(path)
+        : Path.GetFullPath(path, AppContext.BaseDirectory);
+
+    private enum DashboardView
+    {
+        Main,
+        BackgroundConfirmation,
+        ServiceInfo
     }
 
     private sealed class TerminalSession : IDisposable
@@ -125,7 +251,11 @@ internal sealed class TerminalDashboardService(
             return new TerminalSession(ansi, handle, originalMode, originalTitle);
         }
 
-        public void Render(ProxyRuntimeSnapshot snapshot)
+        public void Render(
+            ProxyRuntimeSnapshot snapshot,
+            DashboardView view,
+            bool busy,
+            string backgroundLogPath)
         {
             if (disposed)
             {
@@ -134,7 +264,7 @@ internal sealed class TerminalDashboardService(
 
             var width = GetConsoleWidth();
             var height = GetConsoleHeight();
-            var frame = BuildFrame(snapshot, width, height);
+            var frame = BuildFrame(snapshot, width, height, view, busy, backgroundLogPath);
 
             try
             {
@@ -210,72 +340,112 @@ internal sealed class TerminalDashboardService(
         private static IReadOnlyList<DashboardLine> BuildFrame(
             ProxyRuntimeSnapshot snapshot,
             int width,
-            int height)
+            int height,
+            DashboardView view,
+            bool busy,
+            string backgroundLogPath)
         {
             var innerWidth = width - 2;
-            var body = new List<DashboardLine>
-            {
-                Row(" ORBYN TECHNOLOGIES", Brand),
-                Row($" Proxy Core {BrandConsole.GetVersion()}  /  HTTP(S) Gateway", Muted),
-                Divider(innerWidth),
-                Row(BuildStatus(snapshot), StatusColor(snapshot.Status)),
-                Row(BuildMetrics(snapshot), Foreground),
-                Divider(innerWidth),
-                Row(" LISTENERS", Brand)
-            };
+            var body = BuildHeader(innerWidth);
 
-            var listenerLimit = Math.Max(1, Math.Min(snapshot.Listeners.Count, 4));
-            if (snapshot.Listeners.Count == 0)
+            if (view == DashboardView.BackgroundConfirmation)
             {
-                body.Add(Row("   Waiting for listeners...", Muted));
+                body.AddRange(BuildBackgroundDialog(backgroundLogPath));
+            }
+            else if (view == DashboardView.ServiceInfo)
+            {
+                body.AddRange(BuildServiceDialog());
             }
             else
             {
-                foreach (var listener in snapshot.Listeners.Take(listenerLimit))
+                body.Add(Row(BuildStatus(snapshot), StatusColor(snapshot.Status)));
+                body.Add(Row(BuildRuntime(snapshot), Foreground));
+                body.Add(Divider(innerWidth));
+                body.Add(Row("  LIVE TRAFFIC", Brand));
+                body.Add(Row(BuildTraffic(snapshot), Foreground));
+                body.Add(Divider(innerWidth));
+                body.Add(Row("  ACTIVE LISTENERS", Brand));
+
+                if (snapshot.Listeners.Count == 0)
                 {
-                    body.Add(Row($"   > {listener}", Cyan));
+                    body.Add(Row("    ◌  Waiting for listeners...", Muted));
+                }
+                else
+                {
+                    foreach (var listener in snapshot.Listeners.Take(4))
+                    {
+                        body.Add(Row($"    ●  {listener}", Cyan));
+                    }
+                }
+
+                body.Add(Divider(innerWidth));
+                body.Add(Row("  RECENT ACTIVITY", Brand));
+
+                var footerSize = 2;
+                var activitySlots = Math.Max(0, height - body.Count - footerSize - 2);
+                var visibleActivity = snapshot.Activity.TakeLast(activitySlots).ToArray();
+                if (visibleActivity.Length == 0 && activitySlots > 0)
+                {
+                    body.Add(Row("    Nothing to report — proxy is ready", Muted));
+                }
+                else
+                {
+                    foreach (var entry in visibleActivity)
+                    {
+                        body.Add(Row(FormatActivity(entry), LogColor(entry.Level)));
+                    }
                 }
             }
 
             body.Add(Divider(innerWidth));
-            body.Add(Row(" RECENT ACTIVITY", Brand));
-
-            var footer = new[]
-            {
-                Divider(innerWidth),
-                Row(" [Q] Quit    [C] Clear activity    [Ctrl+C] Stop", Muted)
-            };
-            var activitySlots = Math.Max(0, height - body.Count - footer.Length - 2);
-            var visibleActivity = snapshot.Activity.TakeLast(activitySlots).ToArray();
-
-            if (visibleActivity.Length == 0 && activitySlots > 0)
-            {
-                body.Add(Row("   No activity yet", Muted));
-            }
-            else
-            {
-                foreach (var entry in visibleActivity)
-                {
-                    body.Add(Row(FormatActivity(entry), LogColor(entry.Level)));
-                }
-            }
-
-            body.AddRange(footer);
+            body.Add(Row(BuildFooter(view, busy), busy ? Yellow : Muted));
             while (body.Count > height - 2 && body.Count > 0)
             {
-                body.RemoveAt(body.Count - footer.Length - 1);
+                body.RemoveAt(body.Count - 3);
             }
 
             var lines = new List<DashboardLine>(body.Count + 2)
             {
-                new("┌" + new string('─', innerWidth) + "┐", Brand)
+                new("╭" + new string('─', innerWidth) + "╮", Brand)
             };
             lines.AddRange(body.Select(line => new DashboardLine(
                 "│" + Fit(line.Text, innerWidth) + "│",
                 line.Color)));
-            lines.Add(new DashboardLine("└" + new string('─', innerWidth) + "┘", Brand));
+            lines.Add(new DashboardLine("╰" + new string('─', innerWidth) + "╯", Brand));
             return lines;
         }
+
+        private static List<DashboardLine> BuildHeader(int width) =>
+        [
+            Row("  ORBYN TECHNOLOGIES                                      SECURE EDGE", Brand),
+            Row($"  PROXY CORE  v{BrandConsole.GetVersion()}    HTTP(S) · SOCKS · POLICY ENGINE", Foreground),
+            Divider(width)
+        ];
+
+        private static IEnumerable<DashboardLine> BuildBackgroundDialog(string logPath) =>
+        [
+            Row("", Foreground),
+            Row("  MOVE TO BACKGROUND", Brand),
+            Row("", Foreground),
+            Row("  The active listener will be restarted in a detached headless process.", Foreground),
+            Row($"  Activity will be written to: {logPath}", Cyan),
+            Row("  Use systemd or Windows Service when automatic startup and recovery are required.", Muted),
+            Row("", Foreground),
+            Row("  Press Enter to continue, or B / Escape to cancel.", Yellow)
+        ];
+
+        private static IEnumerable<DashboardLine> BuildServiceDialog() =>
+        [
+            Row("", Foreground),
+            Row("  SERVICE & HEADLESS MODE", Brand),
+            Row("", Foreground),
+            Row("  Direct:   Proxy.Core --service", Cyan),
+            Row("  Linux:    install the documented systemd unit, then use systemctl.", Foreground),
+            Row("  Windows:  install the published executable with Service Control Manager.", Foreground),
+            Row("", Foreground),
+            Row("  Managed services provide boot startup, restart policies, and OS-native logs.", Muted),
+            Row("  Press B to run detached now, or S / Escape to return.", Yellow)
+        ];
 
         private static DashboardLine Row(string text, string color) => new(text, color);
 
@@ -286,14 +456,28 @@ internal sealed class TerminalDashboardService(
             var uptime = snapshot.StartedAt is null
                 ? "--:--:--"
                 : FormatDuration(DateTimeOffset.UtcNow - snapshot.StartedAt.Value);
-            return $" {StatusMarker(snapshot.Status)} {snapshot.Status.ToString().ToUpperInvariant(),-9}  " +
-                   $"{snapshot.StatusMessage}    UPTIME {uptime}";
+            return $"  {StatusMarker(snapshot.Status)}  {snapshot.Status.ToString().ToUpperInvariant(),-10} " +
+                   $"{snapshot.StatusMessage,-40} UPTIME  {uptime}";
         }
 
-        private static string BuildMetrics(ProxyRuntimeSnapshot snapshot) =>
-            $" TLS {snapshot.TlsMode,-9}  CONNECTIONS {snapshot.ActiveConnections,5:N0}  " +
-            $"REQUESTS {snapshot.Requests,7:N0}  TUNNELS {snapshot.Tunnels,7:N0}  " +
-            $"BLOCKED {snapshot.Blocked,5:N0}  ERRORS {snapshot.Errors,4:N0}";
+        private static string BuildRuntime(ProxyRuntimeSnapshot snapshot) =>
+            $"     TLS MODE  {snapshot.TlsMode,-12}    ACTIVE CONNECTIONS  {snapshot.ActiveConnections,8:N0}";
+
+        private static string BuildTraffic(ProxyRuntimeSnapshot snapshot) =>
+            $"     REQUESTS  {snapshot.Requests,10:N0}    TUNNELS  {snapshot.Tunnels,10:N0}    " +
+            $"BLOCKED  {snapshot.Blocked,8:N0}    ERRORS  {snapshot.Errors,6:N0}";
+
+        private static string BuildFooter(DashboardView view, bool busy)
+        {
+            if (busy)
+            {
+                return "  ◆  WORKING…   controls are temporarily locked";
+            }
+
+            return view == DashboardView.Main
+                ? "  [R] Restart    [B] Background    [S] Service    [C] Clear    [Q] Quit"
+                : "  [Escape] Back";
+        }
 
         private static string FormatActivity(ProxyActivity entry)
         {
@@ -307,7 +491,7 @@ internal sealed class TerminalDashboardService(
                 LogLevel.Critical => "CRT",
                 _ => "---"
             };
-            return $" {entry.Timestamp:HH:mm:ss}  {level}  {entry.Source,-24} {entry.Message}";
+            return $"    {entry.Timestamp:HH:mm:ss}  {level}  {entry.Source,-22}  {entry.Message}";
         }
 
         private static string FormatDuration(TimeSpan duration) => duration.TotalDays >= 1
@@ -319,6 +503,7 @@ internal sealed class TerminalDashboardService(
             ProxyRunStatus.Running => "●",
             ProxyRunStatus.Faulted => "!",
             ProxyRunStatus.Stopped => "■",
+            ProxyRunStatus.Restarting => "↻",
             _ => "◆"
         };
 
@@ -326,6 +511,7 @@ internal sealed class TerminalDashboardService(
         {
             ProxyRunStatus.Running => Green,
             ProxyRunStatus.Faulted => Red,
+            ProxyRunStatus.Restarting => Yellow,
             ProxyRunStatus.Stopping => Yellow,
             ProxyRunStatus.Stopped => Muted,
             _ => Cyan

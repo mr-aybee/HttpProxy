@@ -108,6 +108,21 @@ internal sealed class ProxyOptionsValidator(IHostEnvironment environment) : IVal
             errors.Add("Terminal MaxActivityEntries must be between 20 and 1000.");
         }
 
+        if (string.IsNullOrWhiteSpace(options.Background.LogFilePath))
+        {
+            errors.Add("Background LogFilePath cannot be empty.");
+        }
+
+        if (options.Background.MaxFileSizeBytes < 64 * 1024)
+        {
+            errors.Add("Background MaxFileSizeBytes must be at least 65536.");
+        }
+
+        if (options.Background.MaxRolledFiles is < 1 or > 20)
+        {
+            errors.Add("Background MaxRolledFiles must be between 1 and 20.");
+        }
+
         ValidateExternalProxy("Http", options.Upstream.Http, errors);
         ValidateExternalProxy("Https", options.Upstream.Https, errors);
 

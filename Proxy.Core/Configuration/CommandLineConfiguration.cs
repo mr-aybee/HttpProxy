@@ -16,6 +16,8 @@ internal static class CommandLineConfiguration
         ["--http2"] = "Proxy:Protocols:EnableHttp2",
         ["--http3"] = "Proxy:Protocols:EnableHttp3",
         ["--service"] = "Commands:Service",
+        ["--background"] = "Commands:Background",
+        ["--background-child"] = "Commands:BackgroundChild",
         ["--validate-config"] = "Commands:ValidateConfig",
         ["--print-config"] = "Commands:PrintConfig"
     };
