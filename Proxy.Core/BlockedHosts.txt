@@ -1,0 +1,3 @@
+# One host per line. Use *.example.com to include the root and all subdomains.
+# example.com
+# *.tracking.example
