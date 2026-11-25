@@ -187,3 +187,13 @@ chmod +x /opt/orbyn/proxy-core/Proxy.Core
 ```
 
 The same published executable supports both the terminal dashboard and service hosting; the runtime environment and `--service` flag select the experience.
+
+## Repository structure
+
+| Path | Responsibility |
+| --- | --- |
+| `Proxy.Core/` | Current .NET worker-service implementation |
+| `ProxyServer/` | Original Windows Forms application |
+| `ProxyServer.sln` | Existing solution |
+
+For development, start with the `Proxy.Core` project. Test configuration changes on loopback before enabling remote access. Do not commit credentials or generated private keys.
