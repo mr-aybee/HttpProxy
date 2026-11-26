@@ -1,5 +1,9 @@
 # Orbyn Proxy Core
 
+[![CI](https://github.com/mr-aybee/http-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/mr-aybee/http-proxy/actions/workflows/ci.yml)
+![.NET](https://img.shields.io/badge/.NET-10.0-512BD4)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 `Proxy.Core` is a .NET 10 Worker Service from Orbyn Technologies using Titanium.Web.Proxy 5.2.0. It provides a full-screen terminal control surface, a detachable background mode, and a headless host for Windows Service, systemd, containers, and process supervisors.
 
 The original .NET Framework WinForms application remains in `ProxyServer`; new development should target `Proxy.Core`.
@@ -197,3 +201,15 @@ The same published executable supports both the terminal dashboard and service h
 | `ProxyServer.sln` | Existing solution |
 
 For development, start with the `Proxy.Core` project. Test configuration changes on loopback before enabling remote access. Do not commit credentials or generated private keys.
+
+## Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the branch, build and pull-request workflow. Please report security issues privately through [GitHub security advisories](https://github.com/mr-aybee/http-proxy/security/advisories/new), not public issues.
+
+## Code of Conduct
+
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). By participating you agree to uphold it.
+
+## License
+
+Released under the [MIT License](LICENSE). © 2026 Abdullah Shahid.
